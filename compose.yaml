@@ -1,0 +1,79 @@
+# RuProbe — конфигурация запуска.
+#
+# Один файл на оба сервиса: YAML-анкоры не работают между файлами, поэтому
+# override-файлы сознательно не используются (см. раздел 7 плана).
+#
+# Ключ `version:` не указан: он устарел и выдаёт warning.
+#
+# Важно про анкоры: `<<: *common` — ПОВЕРХНОСТНЫЙ мердж. Одно поле внутри
+# общего блока переопределить нельзя, вложенный ключ затирается целиком.
+# Поэтому общий блок содержит только то, что не хочется менять точечно.
+
+x-common: &common
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      # Без ротации логи контейнеров съедят диск за недели.
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  agent:
+    <<: *common
+    build:
+      context: ./agent
+      dockerfile: Dockerfile
+    image: ruprobe-agent:local
+    container_name: ruprobe-agent
+    environment:
+      AGENT_ADDR: ":8080"
+      AGENT_WORKERS: "8"
+      AGENT_JOB_TTL: "10m"
+      AGENT_DEFAULT_TIMEOUT: "5s"
+      AGENT_THROUGHPUT_BYTES: "1048576"
+      AGENT_NEIGHBOR_LIMIT: "16"
+      AGENT_NEIGHBOR_SCOPE: "/24"
+    # ICMP-зонд использует raw-сокет. Без CAP_NET_RAW он честно деградирует до
+    # TCP-пробы и помечает это в поле Error, но диагностика беднее.
+    cap_add:
+      - NET_RAW
+    networks:
+      - ruprobe
+    # Порт наружу не публикуется: контракт внутренний.
+
+  bot:
+    <<: *common
+    build:
+      context: ./bot
+      dockerfile: Dockerfile
+    image: ruprobe-bot:local
+    container_name: ruprobe-bot
+    depends_on:
+      agent:
+        condition: service_healthy
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN:?BOT_TOKEN is required}
+      AGENT_URL: "http://agent:8080"
+      DB_PATH: "/data/ruprobe.sqlite3"
+      REGION: ${REGION:-default}
+      OPERATOR: ${OPERATOR:-default}
+      OBSERVATION_NAME: ${OBSERVATION_NAME:-local agent}
+      AGENT_TIMEOUT_MS: ${AGENT_TIMEOUT_MS:-5000}
+      POLL_INTERVAL_S: ${POLL_INTERVAL_S:-1.5}
+      POLL_TIMEOUT_S: ${POLL_TIMEOUT_S:-600}
+      DRAFT_INTERVAL_S: ${DRAFT_INTERVAL_S:-4}
+    volumes:
+      # Именованный том, а не bind-mount: SQLite в WAL пишет рядом с базой,
+      # и на сетевой ФС это ломается.
+      - ruprobe-data:/data
+    networks:
+      - ruprobe
+
+networks:
+  ruprobe:
+    name: ruprobe
+
+volumes:
+  ruprobe-data:
+    name: ruprobe-data
