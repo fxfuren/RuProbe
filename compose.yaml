@@ -65,6 +65,11 @@ services:
       DRAFT_INTERVAL_S: ${DRAFT_INTERVAL_S:-4}
       NEIGHBOR_LIMIT: ${NEIGHBOR_LIMIT:-16}
       NEIGHBOR_SCOPE: ${NEIGHBOR_SCOPE:-/24}
+      REGISTRY_ENABLED: ${REGISTRY_ENABLED:-true}
+      REGISTRY_REFRESH_S: ${REGISTRY_REFRESH_S:-3600}
+      REGISTRY_URL_IPSUM: ${REGISTRY_URL_IPSUM:-https://antifilter.download/list/ipsum.lst}
+      REGISTRY_URL_IPSMART: ${REGISTRY_URL_IPSMART:-https://antifilter.download/list/ipsmart.lst}
+      REGISTRY_CACHE_PATH: ${REGISTRY_CACHE_PATH:-/data/registry_cache.txt}
     volumes:
       # Именованный том, а не bind-mount: SQLite в WAL пишет рядом с базой,
       # и на сетевой ФС это ломается.

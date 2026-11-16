@@ -21,6 +21,7 @@ from .agent_client import AgentClient, JobSnapshot
 from .db import Database
 from .keyboards import MAIN_MENU, quick_targets
 from .models import TargetKind
+from .registry import Registry, registry_note_for
 from .rendering import (
     InputRichBlockParagraph,
     InputRichMessage,
@@ -59,8 +60,8 @@ HELP_TEXT = (
 )
 
 
-def build_router(db: Database, settings: Settings) -> Router:
-    """Собирает роутер с доступом к БД и настройкам."""
+def build_router(db: Database, settings: Settings, registry: Registry | None = None) -> Router:
+    """Собирает роутер с доступом к БД, настройкам и реестру блокировок."""
 
     @router.message(CommandStart())
     async def handle_start(message: Message, state: FSMContext) -> None:
@@ -141,7 +142,27 @@ async def _start_probe(
         chat_id=message.chat.id,
     )
 
-    status_message = await message.answer(f"Проверяю {target}…")
+    # Сначала база: адрес в реестре → с высокой вероятностью в бане.
+    # Проверка зондами идёт дальше в любом случае — реестр подтверждается фактом.
+    registry_hit = None
+    if registry is not None:
+        try:
+            registry_hit = registry.lookup(target)
+        except Exception:  # noqa: BLE001 — реестр не должен ронять прогон
+            log.exception("registry lookup failed")
+
+    registry_line = ""
+    if registry_hit is not None:
+        registry_line = registry_note_for(registry_hit)
+        if registry_hit.known:
+            registry_line = "в реестре: да" if registry_hit.listed else "в реестре: нет"
+        else:
+            registry_line = "в реестре: неизвестно"
+
+    status_text = f"Проверяю {target}…"
+    if registry_line:
+        status_text = f"Проверяю {target} ({registry_line})…"
+    status_message = await message.answer(status_text)
     observation = point.label()
 
     task = asyncio.create_task(
@@ -154,6 +175,7 @@ async def _start_probe(
             observation=observation,
             chat_id=message.chat.id,
             status_message_id=status_message.message_id,
+            registry_hit=registry_hit,
         )
     )
     # Без этого исключение фоновой задачи теряется в логе asyncio без контекста
@@ -179,6 +201,7 @@ async def _run_and_report(
     observation: str,
     chat_id: int,
     status_message_id: int,
+    registry_hit=None,
 ) -> None:
     """Прогоняет проверку, обновляя прогресс черновиком и завершая отчётом."""
     last_draft = 0.0
@@ -213,6 +236,7 @@ async def _run_and_report(
             observation_point_id=0,
             check_id=check_id,
             probes=_probes_for(target),
+            registry_hit=registry_hit,
             on_progress=on_progress,
         )
 

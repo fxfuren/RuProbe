@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bot" / "src"))
 from ruprobe_bot.agent_client import AgentClient  # noqa: E402
 from ruprobe_bot.db import Database  # noqa: E402
 from ruprobe_bot.models import CheckStatus  # noqa: E402
+from ruprobe_bot.registry import BlockRegistry  # noqa: E402
 from ruprobe_bot.rendering import build_rich_message, build_short_report, enforce_limits  # noqa: E402
 from ruprobe_bot.service import (  # noqa: E402
     create_check,
@@ -54,6 +55,15 @@ async def main() -> int:
     await db.create_all()
     stale = await mark_stale_checks_failed(db)
     print(f"stale checks marked failed at startup: {stale}")
+
+    # Реестр: кэш/сеть по путям из настроек. Недоступен — работаем без него.
+    registry = BlockRegistry(
+        urls=[settings.registry_url_ipsum, settings.registry_url_ipsmart],
+        cache_path=db_path.parent / "registry_cache.txt",
+        refresh_s=settings.registry_refresh_s,
+    )
+    await registry.refresh()
+    print(f"registry known: {registry.known}, age: {registry.list_age_s()}s")
 
     point = await db.ensure_observation_point()
     failures = 0
@@ -126,6 +136,8 @@ async def main() -> int:
         observation_point_id=point.id,
     )
     started = _time.monotonic()
+    registry_hit = registry.lookup("192.0.2.1")
+    print(f"  registry: known={registry_hit.known}, listed={registry_hit.listed}")
     report = await run_check(
         db,
         agent,
@@ -134,6 +146,7 @@ async def main() -> int:
         observation_point_id=point.id,
         check_id=check_id,
         probes=["tcp", "tcp_alt_ports", "udp", "icmp", "neighbors"],
+        registry_hit=registry_hit,
         on_progress=on_progress,
     )
     elapsed = _time.monotonic() - started
@@ -171,6 +184,7 @@ async def main() -> int:
         observation_point_id=point.id,
         check_id=check_id,
         probes=["tcp", "tcp_alt_ports", "udp", "icmp", "neighbors"],
+        registry_hit=registry.lookup("177.3.213.44"),
         on_progress=on_progress,
     )
     if report.status is CheckStatus.DONE:
@@ -178,7 +192,8 @@ async def main() -> int:
             print(
                 f"  {item.target}: {item.classification.klass.value} "
                 f"({item.classification.confidence:.0%}), icmp_method={item.icmp_method}, "
-                f"neighbors={item.neighbors_alive}/{item.neighbors_dead}"
+                f"neighbors={item.neighbors_alive}/{item.neighbors_dead}, "
+                f"registry={'да' if item.registry_note.startswith('Адрес в реестре') else 'нет/—'}"
             )
     else:
         print(f"  error: {report.error}")

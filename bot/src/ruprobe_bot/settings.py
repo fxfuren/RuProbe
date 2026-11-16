@@ -40,6 +40,20 @@ class Settings(BaseSettings):
     neighbor_limit: int = Field(default=16, alias="NEIGHBOR_LIMIT")
     neighbor_scope: str = Field(default="/24", alias="NEIGHBOR_SCOPE")
 
+    # Реестр блокировок (antifilter.network) как предфильтр: сначала смотрим
+    # базу, потом прогоняем зонды. Не сигнал классификатора!
+    registry_enabled: bool = Field(default=True, alias="REGISTRY_ENABLED")
+    registry_refresh_s: int = Field(default=3600, alias="REGISTRY_REFRESH_S")
+    registry_url_ipsum: str = Field(
+        default="https://antifilter.download/list/ipsum.lst", alias="REGISTRY_URL_IPSUM"
+    )
+    registry_url_ipsmart: str = Field(
+        default="https://antifilter.download/list/ipsmart.lst", alias="REGISTRY_URL_IPSMART"
+    )
+    registry_cache_path: Path = Field(
+        default=Path("/data/registry_cache.txt"), alias="REGISTRY_CACHE_PATH"
+    )
+
     # Прогресс через черновик: черновик живёт 30 секунд, поэтому обновляем чаще.
     draft_interval_s: float = Field(default=4.0, alias="DRAFT_INTERVAL_S")
 

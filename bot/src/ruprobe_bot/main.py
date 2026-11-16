@@ -22,6 +22,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from .agent_client import AgentClient, AgentError
 from .db import Database
 from .handlers import build_router
+from .registry import Registry
 from .service import mark_stale_checks_failed
 from .settings import get_settings
 
@@ -69,6 +70,11 @@ async def async_main() -> None:
     if stale:
         log.info("marked %d stale checks as failed", stale)
 
+    # Реестр блокировок как фоновая загрузка: кэш — мгновенно, сеть — по графику.
+    registry = Registry(settings) if settings.registry_enabled else None
+    if registry is not None:
+        registry.start()
+
     await wait_for_agent(settings)
 
     bot = Bot(
@@ -76,7 +82,7 @@ async def async_main() -> None:
         default=DefaultBotProperties(),
     )
     dispatcher = Dispatcher(storage=MemoryStorage())
-    dispatcher.include_router(build_router(db, settings))
+    dispatcher.include_router(build_router(db, settings, registry))
 
     try:
         await bot.delete_webhook(drop_pending_updates=False)
@@ -89,6 +95,8 @@ async def async_main() -> None:
     finally:
         await bot.session.close()
         await db.dispose()
+        if registry is not None:
+            await registry.stop()
 
 
 def main() -> None:

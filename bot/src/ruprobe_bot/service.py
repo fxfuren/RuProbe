@@ -20,6 +20,7 @@ from sqlalchemy import select, update
 from .agent_client import AgentClient, AgentError, AgentJobLost, JobSnapshot
 from .classifier import Classification, classify
 from .db import Database
+from .registry import RegistryHit, registry_note_for
 from .models import (
     Check,
     CheckStatus,
@@ -76,6 +77,7 @@ class TargetReport:
     neighbors_probed: int = 0
     icmp_method: str = ""
     skipped_probes: list[str] = field(default_factory=list)
+    registry_note: str = ""
     raw: dict = field(default_factory=dict)
 
 
@@ -183,7 +185,7 @@ async def fail_check(db: Database, check_id: int, error: str) -> None:
 
 
 async def save_results(
-    db: Database, check_id: int, snapshot: JobSnapshot
+    db: Database, check_id: int, snapshot: JobSnapshot, registry_hit: RegistryHit | None = None
 ) -> list[TargetReport]:
     """Классифицирует факты и сохраняет результаты вместе с вердиктами."""
     reports: list[TargetReport] = []
@@ -195,6 +197,18 @@ async def save_results(
 
         for item in snapshot.results:
             raw = item.get("facts") or {}
+            # Реестр — аннотация, не сигнал: в факты кладётся как отдельный ключ,
+            # классификатор весов от него не получает.
+            if registry_hit is not None:
+                raw = {
+                    **raw,
+                    "registry": {
+                        "listed": registry_hit.listed,
+                        "source": registry_hit.source,
+                        "prefix": registry_hit.prefix,
+                        "known": registry_hit.known,
+                    },
+                }
             classification = classify(raw)
             tcp = raw.get("tcp") or {}
             throughput = raw.get("throughput") or {}
@@ -262,6 +276,9 @@ async def save_results(
                     neighbors_probed=int(neighbors.get("probed") or 0),
                     icmp_method=str(icmp.get("method") or ""),
                     skipped_probes=skipped,
+                    registry_note=registry_note_for(
+                        registry_hit, classification.klass.value
+                    ),
                     raw=raw,
                 )
             )
@@ -307,6 +324,7 @@ async def run_check(
     check_id: int,
     probes: list[str] | None = None,
     port: int | None = None,
+    registry_hit: RegistryHit | None = None,
     on_progress: Callable[[JobSnapshot], object] | None = None,
 ) -> CheckReport:
     """Полный цикл: задание → опрос → классификация → запись."""
@@ -350,7 +368,7 @@ async def run_check(
         )
 
     await mark_check_running(db, check_id, job_id, message_id=None)
-    reports = await save_results(db, check_id, snapshot)
+    reports = await save_results(db, check_id, snapshot, registry_hit=registry_hit)
 
     return CheckReport(
         check_id=check_id,

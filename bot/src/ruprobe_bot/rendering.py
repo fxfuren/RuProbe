@@ -200,10 +200,12 @@ def build_rich_message(report: CheckReport, *, observation: str) -> InputRichMes
                 InputRichBlockParagraph(text="Сигнатур не найдено.")
             )
 
-    # --- сноски: fallback ICMP и пропущенные зонды ---------------------------
+    # --- сноски: реестр, fallback ICMP и пропущенные зонды -------------------
     blocks.append(InputRichBlockDivider())
     for item in shown:
         notes: list[str] = []
+        if item.registry_note:
+            notes.append(item.registry_note)
         if item.icmp_method == "tcp_fallback":
             notes.append(
                 "ICMP недоступен (нет raw-сокета), живость проверена через TCP — интерпретировать осторожно"
