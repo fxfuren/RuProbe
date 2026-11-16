@@ -63,6 +63,8 @@ services:
       POLL_INTERVAL_S: ${POLL_INTERVAL_S:-1.5}
       POLL_TIMEOUT_S: ${POLL_TIMEOUT_S:-600}
       DRAFT_INTERVAL_S: ${DRAFT_INTERVAL_S:-4}
+      NEIGHBOR_LIMIT: ${NEIGHBOR_LIMIT:-16}
+      NEIGHBOR_SCOPE: ${NEIGHBOR_SCOPE:-/24}
     volumes:
       # Именованный том, а не bind-mount: SQLite в WAL пишет рядом с базой,
       # и на сетевой ФС это ломается.

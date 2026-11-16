@@ -31,8 +31,30 @@ from .models import (
 )
 from .settings import Settings
 
-# Зонды, которые имеют смысл для любой цели.
-DEFAULT_PROBES = ["dns", "tcp", "sni", "sni_control", "tls_full", "throughput", "icmp"]
+# Наборы зондов по виду цели (план фикса 177.3.213.44, фаза 1).
+# DOMAIN — полный набор; NET — без dns/doh/sni/sni_control/throughput:
+# SNI с IP как SNI невалиден, throughput без живого сервиса — шум.
+# tcp_alt_ports и udp нужны для IP: без них нельзя развести правило
+# по порту и правило по адресу, и не проверяется блокировка транспорта.
+DOMAIN_PROBES = ["dns", "doh", "tcp", "tcp_alt_ports", "sni", "sni_control", "tls_full", "throughput", "udp", "icmp", "neighbors"]
+NET_PROBES = ["tcp", "tcp_alt_ports", "udp", "icmp", "neighbors"]
+# Для CIDR/RANGE соседи не нужны на каждую цель: они берутся один раз
+# на префикс, иначе шум.
+CIDR_PROBES = ["tcp", "tcp_alt_ports", "udp", "icmp"]
+RANGE_PROBES = ["tcp", "tcp_alt_ports", "udp", "icmp"]
+# Совместимость: DEFAULT_PROBES — набор для домена.
+DEFAULT_PROBES = DOMAIN_PROBES
+
+
+def probes_for(kind: TargetKind) -> list[str]:
+    """Набор зондов по виду цели — единый источник (фаза 1 плана)."""
+    if kind is TargetKind.NET:
+        return list(NET_PROBES)
+    if kind is TargetKind.CIDR:
+        return list(CIDR_PROBES)
+    if kind is TargetKind.RANGE:
+        return list(RANGE_PROBES)
+    return list(DOMAIN_PROBES)
 
 
 @dataclass(slots=True)
@@ -45,8 +67,15 @@ class TargetReport:
     rtt_ms: float | None = None
     reset_received: bool = False
     timeout_happened: bool = False
+    tls_reset_received: bool = False
+    tls_timeout_happened: bool = False
     throughput_bps: float | None = None
     retransmits: int | None = None
+    neighbors_alive: int = 0
+    neighbors_dead: int = 0
+    neighbors_probed: int = 0
+    icmp_method: str = ""
+    skipped_probes: list[str] = field(default_factory=list)
     raw: dict = field(default_factory=dict)
 
 
@@ -169,14 +198,31 @@ async def save_results(
             classification = classify(raw)
             tcp = raw.get("tcp") or {}
             throughput = raw.get("throughput") or {}
+            icmp = raw.get("icmp") or {}
+            neighbors = raw.get("neighbors") or {}
+            tls_full = raw.get("tls_full") or {}
+            sni = raw.get("sni") or {}
+
+            # RST/timeout берём не только из tcp, но и OR по sni/tls_full:
+            # RST и молчаливый drop на TLS-слое терять нельзя (план, дефект 3.6).
+            reset_received = bool(
+                tcp.get("reset_received")
+                or sni.get("reset_received")
+                or tls_full.get("reset_received")
+            )
+            timeout_happened = bool(
+                tcp.get("timeout_happened")
+                or sni.get("silent_drop")
+                or tls_full.get("timeout_happened")
+            )
 
             probe_result = ProbeResult(
                 check_id=check_id,
                 target_value=item.get("target", "unknown"),
                 target_kind=item.get("kind", "unknown"),
                 rtt_ms=_first_rtt(tcp, raw),
-                reset_received=bool(tcp.get("reset_received")),
-                timeout_happened=bool(tcp.get("timeout_happened")),
+                reset_received=reset_received,
+                timeout_happened=timeout_happened,
                 throughput_bps=throughput.get("throughput_bps"),
                 retransmits=throughput.get("retransmits"),
                 raw=raw,
@@ -194,16 +240,28 @@ async def save_results(
                 )
             )
 
+            skipped = [
+                line.removeprefix("skipped: ").split(":")[0].strip()
+                for line in item.get("errors") or []
+                if line.startswith("skipped: ")
+            ]
             reports.append(
                 TargetReport(
                     target=probe_result.target_value,
                     kind=probe_result.target_kind,
                     classification=classification,
                     rtt_ms=probe_result.rtt_ms,
-                    reset_received=probe_result.reset_received,
-                    timeout_happened=probe_result.timeout_happened,
+                    reset_received=bool(tcp.get("reset_received")),
+                    timeout_happened=bool(tcp.get("timeout_happened")),
+                    tls_reset_received=bool(tls_full.get("reset_received") or sni.get("reset_received")),
+                    tls_timeout_happened=bool(tls_full.get("timeout_happened") or sni.get("silent_drop")),
                     throughput_bps=probe_result.throughput_bps,
                     retransmits=probe_result.retransmits,
+                    neighbors_alive=int(neighbors.get("alive") or 0),
+                    neighbors_dead=int(neighbors.get("dead") or 0),
+                    neighbors_probed=int(neighbors.get("probed") or 0),
+                    icmp_method=str(icmp.get("method") or ""),
+                    skipped_probes=skipped,
                     raw=raw,
                 )
             )
@@ -262,6 +320,8 @@ async def run_check(
             probes=probes,
             timeout_ms=settings.agent_timeout_ms,
             port=port,
+            neighbor_limit=settings.neighbor_limit,
+            neighbor_scope=settings.neighbor_scope,
             poll_interval=settings.poll_interval_s,
             poll_timeout=settings.poll_timeout_s,
             on_progress=on_progress,
@@ -315,6 +375,11 @@ def _guess_kind(raw: str) -> str:
 
 __all__ = [
     "DEFAULT_PROBES",
+    "DOMAIN_PROBES",
+    "NET_PROBES",
+    "CIDR_PROBES",
+    "RANGE_PROBES",
+    "probes_for",
     "CheckReport",
     "TargetReport",
     "classify_target_kind",

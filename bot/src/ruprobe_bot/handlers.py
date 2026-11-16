@@ -28,7 +28,7 @@ from .rendering import (
     build_short_report,
     enforce_limits,
 )
-from .service import DEFAULT_PROBES, CheckReport, create_check, run_check
+from .service import CheckReport, create_check, probes_for, run_check
 from .settings import Settings
 
 log = logging.getLogger(__name__)
@@ -47,9 +47,11 @@ HELP_TEXT = (
     "• адрес — 1.1.1.1\n"
     "• подсеть — 192.0.2.0/29\n"
     "• диапазон — 1.2.3.4-1.2.3.20\n\n"
-    "Агент выполняет набор зондов: DNS (системный, публичный, DoH), TCP, "
-    "проверку SNI с ClientHello, контрольную пробу с другим SNI, полный TLS, "
-    "замер пропускной способности, UDP/QUIC и ICMP.\n\n"
+    "Для домена: DNS (системный, публичный, DoH), TCP, TCP по альтернативным "
+    "портам, проверка SNI с ClientHello, контрольная проба с другим SNI, полный "
+    "TLS, замер пропускной способности, UDP/QUIC, ICMP и соседи.\n"
+    "Для голого IP: TCP, TCP по альтернативным портам, UDP/QUIC, ICMP и соседи "
+    "— без DNS и без SNI-проб: SNI с IP как именем невалиден.\n\n"
     "Результат — вероятностная классификация по сигнатурам, а не утверждение "
     "о причине. Классы: блокировка по адресу/порту, блокировка по SNI, "
     "деградация пропускной способности, вмешательство в DNS, "
@@ -261,6 +263,8 @@ def _draft_message(text: str):
 
 def _draft_text(target: str, snapshot: JobSnapshot) -> str:
     progress = snapshot.progress
+    if snapshot.current_probe:
+        return f"Проверяю {target}: {snapshot.current_probe}…"
     if progress.total:
         return f"Проверяю {target}: {progress.completed} из {progress.total} ({progress.percent}%)"
     return f"Проверяю {target}…"
@@ -278,10 +282,5 @@ def _target_kind(raw: str) -> TargetKind:
 
 
 def _probes_for(target: str) -> list[str]:
-    """Набор зондов зависит от вида цели: DNS и SNI бессмысленны для голого IP,
-    а перебор соседей нужен именно для адресов."""
-    probes = list(DEFAULT_PROBES)
-    if _target_kind(target) is TargetKind.NET:
-        probes = [p for p in probes if p not in {"dns", "doh"}]
-        probes.append("neighbors")
-    return probes
+    """Набор зондов зависит от вида цели; единый источник — service.probes_for."""
+    return probes_for(_target_kind(target))

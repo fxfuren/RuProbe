@@ -45,6 +45,7 @@ class JobSnapshot:
     progress: JobProgress = field(default_factory=JobProgress)
     results: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
+    current_probe: str | None = None
 
     @property
     def is_done(self) -> bool:
@@ -102,6 +103,7 @@ class AgentClient:
         port: int | None = None,
         throughput_bytes: int | None = None,
         neighbor_limit: int | None = None,
+        neighbor_scope: str | None = None,
         expand_limit: int | None = None,
     ) -> str:
         """Создаёт задание и возвращает его идентификатор."""
@@ -116,6 +118,8 @@ class AgentClient:
             payload["port"] = port
         if neighbor_limit:
             payload["neighbor_limit"] = neighbor_limit
+        if neighbor_scope:
+            payload["neighbor_scope"] = neighbor_scope
         if expand_limit:
             payload["expand_limit"] = expand_limit
 
@@ -153,6 +157,7 @@ class AgentClient:
             ),
             results=data.get("results") or [],
             error=data.get("error"),
+            current_probe=data.get("current_probe"),
         )
 
     async def run_job(
@@ -162,6 +167,8 @@ class AgentClient:
         probes: list[str] | None = None,
         timeout_ms: int | None = None,
         port: int | None = None,
+        neighbor_limit: int | None = None,
+        neighbor_scope: str | None = None,
         poll_interval: float = 1.5,
         poll_timeout: float = 600.0,
         on_progress: Any = None,
@@ -173,7 +180,12 @@ class AgentClient:
         агент на длинных диапазонах.
         """
         job_id = await self.submit_batch(
-            targets, probes=probes, timeout_ms=timeout_ms, port=port
+            targets,
+            probes=probes,
+            timeout_ms=timeout_ms,
+            port=port,
+            neighbor_limit=neighbor_limit,
+            neighbor_scope=neighbor_scope,
         )
 
         loop = asyncio.get_running_loop()

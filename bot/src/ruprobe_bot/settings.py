@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     poll_timeout_s: float = Field(default=600.0, alias="POLL_TIMEOUT_S")
     agent_timeout_ms: int = Field(default=5000, alias="AGENT_TIMEOUT_MS")
     throughput_bytes: int = Field(default=1 << 20, alias="THROUGHPUT_BYTES")
+    neighbor_limit: int = Field(default=16, alias="NEIGHBOR_LIMIT")
+    neighbor_scope: str = Field(default="/24", alias="NEIGHBOR_SCOPE")
 
     # Прогресс через черновик: черновик живёт 30 секунд, поэтому обновляем чаще.
     draft_interval_s: float = Field(default=4.0, alias="DRAFT_INTERVAL_S")

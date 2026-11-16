@@ -89,12 +89,17 @@ def _fmt_throughput(value: float | None) -> str:
 
 
 def _transport_note(report: TargetReport) -> str:
-    """RST и timeout — разные события, и в отчёте они тоже разные строки."""
+    """TCP и TLS — разные слои, и их RST/timeout в отчёте тоже разные."""
+    parts: list[str] = []
     if report.reset_received:
-        return "RST"
-    if report.timeout_happened:
-        return "таймаут"
-    return "—"
+        parts.append("TCP RST")
+    elif report.timeout_happened:
+        parts.append("TCP таймаут")
+    if report.tls_reset_received:
+        parts.append("TLS RST")
+    elif report.tls_timeout_happened:
+        parts.append("TLS таймаут")
+    return ", ".join(parts) if parts else "—"
 
 
 def build_rich_message(report: CheckReport, *, observation: str) -> InputRichMessage:
@@ -148,6 +153,7 @@ def build_rich_message(report: CheckReport, *, observation: str) -> InputRichMes
             _cell(RichTextBold(text="RTT"), header=True),
             _cell(RichTextBold(text="Передача"), header=True),
             _cell(RichTextBold(text="Транспорт"), header=True),
+            _cell(RichTextBold(text="Соседи"), header=True),
         ]
     ]
     limit = _max_rows()
@@ -194,6 +200,30 @@ def build_rich_message(report: CheckReport, *, observation: str) -> InputRichMes
                 InputRichBlockParagraph(text="Сигнатур не найдено.")
             )
 
+    # --- сноски: fallback ICMP и пропущенные зонды ---------------------------
+    blocks.append(InputRichBlockDivider())
+    for item in shown:
+        notes: list[str] = []
+        if item.icmp_method == "tcp_fallback":
+            notes.append(
+                "ICMP недоступен (нет raw-сокета), живость проверена через TCP — интерпретировать осторожно"
+            )
+        if item.skipped_probes:
+            notes.append(f"Пропущено: {', '.join(item.skipped_probes)} — TCP не установился")
+        if item.neighbors_probed:
+            notes.append(
+                f"Соседи {item.neighbors_alive}/{item.neighbors_dead} (проверено {item.neighbors_probed})"
+            )
+        if notes:
+            blocks.append(
+                InputRichBlockParagraph(
+                    text=[
+                        RichTextBold(text=f"{item.target}: "),
+                        RichTextItalic(text="; ".join(notes)),
+                    ]
+                )
+            )
+
     blocks.append(InputRichBlockDivider())
     blocks.append(InputRichBlockParagraph(text=RichTextItalic(text=DISCLAIMER)))
     return InputRichMessage(blocks=blocks)  # type: ignore[arg-type]
@@ -207,6 +237,9 @@ def _max_rows() -> int:
 
 def _row_for(item: TargetReport) -> list[RichBlockTableCell]:
     klass = item.classification.klass
+    neighbors = "—"
+    if item.neighbors_probed:
+        neighbors = f"{item.neighbors_alive}/{item.neighbors_dead}"
     return [
         _cell(RichTextCode(text=item.target)),
         _cell(f"{_CLASS_MARK.get(klass, '?')} {class_label(klass)}"),
@@ -214,6 +247,7 @@ def _row_for(item: TargetReport) -> list[RichBlockTableCell]:
         _cell(_fmt_rtt(item.rtt_ms), align="right"),
         _cell(_fmt_throughput(item.throughput_bps), align="right"),
         _cell(_transport_note(item), align="center"),
+        _cell(neighbors, align="center"),
     ]
 
 
@@ -309,8 +343,12 @@ def build_short_report(report: CheckReport, *, observation: str) -> str:
         ]
         if item.rtt_ms is not None:
             parts.append(f"RTT {_fmt_rtt(item.rtt_ms)}")
-        if item.reset_received:
+        if item.tls_reset_received:
+            parts.append("получен RST на TLS")
+        elif item.reset_received:
             parts.append("получен RST")
+        elif item.tls_timeout_happened:
+            parts.append("TLS не отвечал до таймаута")
         elif item.timeout_happened:
             parts.append("ответа не было до таймаута")
         return " | ".join(parts)

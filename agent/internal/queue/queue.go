@@ -46,13 +46,14 @@ type Progress struct {
 
 // JobState — наблюдаемое состояние задания.
 type JobState struct {
-	JobID     string         `json:"job_id"`
-	Status    Status         `json:"status"`
-	Progress  Progress       `json:"progress"`
-	Results   []probe.Result `json:"results"`
-	Err       string         `json:"error,omitempty"`
-	CreatedAt time.Time      `json:"created_at"`
-	UpdatedAt time.Time      `json:"updated_at"`
+	JobID        string         `json:"job_id"`
+	Status       Status         `json:"status"`
+	Progress     Progress       `json:"progress"`
+	CurrentProbe string         `json:"current_probe,omitempty"`
+	Results      []probe.Result `json:"results"`
+	Err          string         `json:"error,omitempty"`
+	CreatedAt    time.Time      `json:"created_at"`
+	UpdatedAt    time.Time      `json:"updated_at"`
 	// TTL — момент, после которого завершённое задание можно выбросить.
 	tTL time.Time
 }
@@ -173,7 +174,7 @@ func (q *Queue) Close() {
 func (q *Queue) worker(ctx context.Context) {
 	for j := range q.ch {
 		q.setRunning(j.id)
-		results := q.execute(ctx, j.volume, func(done int) {
+		results := q.execute(ctx, j.volume, j.id, func(done int) {
 			q.setProgress(j.id, done)
 		})
 		q.finish(j.id, results)
@@ -183,18 +184,19 @@ func (q *Queue) worker(ctx context.Context) {
 // execute прогоняет все цели батча. Цели обрабатываются последовательно внутри
 // задания, параллелизм даётся пулом воркеров: так один большой диапазон не
 // вытесняет остальные задания.
-func (q *Queue) execute(ctx context.Context, volume Volume, onDone func(int)) []probe.Result {
+func (q *Queue) execute(ctx context.Context, volume Volume, jobID string, onDone func(int)) []probe.Result {
 	targets := expandTargets(volume)
 	timeout := time.Duration(volume.TimeoutMS) * time.Millisecond
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
 
-	kinds := volume.Probes
-	for i, k := range kinds {
-		if !k.Valid() {
-			// Неизвестный зонд игнорируем: лучше меньше данных, чем отказ батча.
-			kinds = append(kinds[:i], kinds[i+1:]...)
+	// Неизвестные зонды игнорируем: лучше меньше данных, чем отказ батча.
+	// Фильтрация в новый срез: мутация при итерации пропускала элементы.
+	kinds := make([]probe.Kind, 0, len(volume.Probes))
+	for _, k := range volume.Probes {
+		if k.Valid() {
+			kinds = append(kinds, k)
 		}
 	}
 
@@ -223,6 +225,9 @@ func (q *Queue) execute(ctx context.Context, volume Volume, onDone func(int)) []
 			ThroughputBytes: volume.ThroughputBytes,
 			NeighborLimit:   volume.NeighborLimit,
 			NeighborScope:   volume.NeighborScope,
+			OnProbe: func(name string) {
+				q.setCurrentProbe(jobID, name)
+			},
 		}))
 		onDone(i + 1)
 	}
@@ -267,6 +272,15 @@ func (q *Queue) setProgress(id string, completed int) {
 	defer q.mu.Unlock()
 	if s, ok := q.jobs[id]; ok {
 		s.Progress.Completed = completed
+		s.UpdatedAt = time.Now().UTC()
+	}
+}
+
+func (q *Queue) setCurrentProbe(id string, name string) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if s, ok := q.jobs[id]; ok {
+		s.CurrentProbe = name
 		s.UpdatedAt = time.Now().UTC()
 	}
 }

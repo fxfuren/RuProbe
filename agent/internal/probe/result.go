@@ -158,8 +158,12 @@ type UDPFacts struct {
 
 // ICMPFacts — базовая живость сети.
 type ICMPFacts struct {
-	Host            string  `json:"host"`
-	Alive           bool    `json:"alive"`
+	Host  string `json:"host"`
+	Alive bool   `json:"alive"`
+	// Method — чем измерена живость: "icmp" — настоящий ICMP, "tcp_fallback" —
+	// raw-сокет недоступен, проба деградировала до TCP-connect. Alive=true
+	// ставится только при method == "icmp".
+	Method          string  `json:"method,omitempty"`
 	RTTMS           float64 `json:"rtt_ms"`
 	PacketLoss      float64 `json:"packet_loss"`
 	Sent            int     `json:"sent"`
@@ -172,18 +176,20 @@ type ICMPFacts struct {
 type NeighborFact struct {
 	Address string  `json:"address"`
 	Alive   bool    `json:"alive"`
+	Method  string  `json:"method,omitempty"`
 	RTTMS   float64 `json:"rtt_ms"`
 	Error   string  `json:"error,omitempty"`
 }
 
 // NeighborsFacts — адресное правило против префикса/CDN.
 type NeighborsFacts struct {
-	Base      string         `json:"base"`
-	Scope     string         `json:"scope"`
-	Probed    int            `json:"probed"`
-	Alive     int            `json:"alive"`
-	Dead      int            `json:"dead"`
-	Neighbors []NeighborFact `json:"neighbors"`
+	Base       string         `json:"base"`
+	Scope      string         `json:"scope"`
+	Probed     int            `json:"probed"`
+	Alive      int            `json:"alive"`
+	Dead       int            `json:"dead"`
+	AliveRatio float64        `json:"alive_ratio"`
+	Neighbors  []NeighborFact `json:"neighbors"`
 }
 
 // Facts — контейнер для всех фактов пробы одной цели.

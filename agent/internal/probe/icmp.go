@@ -17,7 +17,7 @@ const (
 
 // runICMP — базовая живость. Отделяет «сеть мертва» от «заблокирован конкретный протокол».
 func runICMP(ctx context.Context, host string, attempts int, deadline time.Duration) *ICMPFacts {
-	facts := &ICMPFacts{Host: host, Sent: attempts}
+	facts := &ICMPFacts{Host: host, Sent: attempts, Method: "icmp"}
 	ip := net.ParseIP(host)
 	if ip == nil {
 		// Разрешаем имя: ICMP доступен только по адресу.
@@ -35,17 +35,34 @@ func runICMP(ctx context.Context, host string, attempts int, deadline time.Durat
 
 	var total time.Duration
 	for i := 0; i < attempts; i++ {
-		rtt, err := icmpOnce(ctx, ip, deadline)
+		if err := ctx.Err(); err != nil {
+			facts.Error = err.Error()
+			break
+		}
+		rtt, method, err := icmpOnce(ctx, ip, deadline)
+		if method != "" {
+			facts.Method = method
+		}
 		if err != nil {
 			facts.Error = err.Error()
+			if method == "tcp_fallback" {
+				break
+			}
 			continue
 		}
 		facts.Received++
 		total += rtt
 	}
-	if facts.Received > 0 {
+	if facts.Received > 0 && facts.Method == "icmp" {
 		facts.Alive = true
 		facts.RTTMS = msFloat(total / time.Duration(facts.Received))
+	}
+	if facts.Method == "tcp_fallback" {
+		facts.Alive = false
+		facts.Received = 0
+		facts.PacketLoss = 1
+		facts.TimeoutHappened = true
+		return facts
 	}
 	facts.PacketLoss = float64(facts.Sent-facts.Received) / float64(facts.Sent)
 	facts.TimeoutHappened = facts.Received == 0
@@ -54,8 +71,12 @@ func runICMP(ctx context.Context, host string, attempts int, deadline time.Durat
 
 // icmpOnce посылает echo через raw-сокет, если он доступен, иначе деградирует
 // до TCP-connect на распространённые порты: в контейнере без CAP_NET_RAW
-// raw-сокет недоступен, и падать из-за этого нельзя.
-func icmpOnce(ctx context.Context, ip net.IP, deadline time.Duration) (time.Duration, error) {
+// raw-сокет недоступен, и падать из-за этого нельзя. Возвращает метод
+// измерения: "icmp" — настоящий ICMP, "tcp_fallback" — деградация.
+// TCP-fallback никогда не даёт Alive=true: успешный TCP-connect возвращается
+// как ошибка "icmp unavailable: no raw socket", чтобы вызывающий код не
+// принял TCP-живость за ICMP-живость.
+func icmpOnce(ctx context.Context, ip net.IP, deadline time.Duration) (time.Duration, string, error) {
 	conn, err := net.DialTimeout("ip4:icmp", ip.String(), deadline)
 	if err == nil {
 		defer conn.Close()
@@ -65,25 +86,28 @@ func icmpOnce(ctx context.Context, ip net.IP, deadline time.Duration) (time.Dura
 		msg := buildICMPEcho(uint16(id), 1)
 		start := time.Now()
 		if _, err := conn.Write(msg); err != nil {
-			return 0, err
+			return 0, "icmp", err
 		}
 		buf := make([]byte, 1500)
 		for {
 			select {
 			case <-ctx.Done():
-				return 0, ctx.Err()
+				return 0, "icmp", ctx.Err()
 			default:
 			}
 			n, err := conn.Read(buf)
 			if err != nil {
-				return 0, err
+				return 0, "icmp", err
 			}
 			if n >= 8 && buf[0] == icmpEchoReply {
-				return time.Since(start), nil
+				return time.Since(start), "icmp", nil
 			}
 		}
 	}
-	return icmpFallback(ctx, ip, deadline)
+	if rtt, ferr := icmpFallback(ctx, ip, deadline); ferr == nil {
+		return rtt, "tcp_fallback", fmt.Errorf("icmp unavailable: no raw socket")
+	}
+	return 0, "tcp_fallback", fmt.Errorf("icmp unavailable: no raw socket and no tcp fallback")
 }
 
 // icmpFallback — TCP-проба на типовые порты. Это не ICMP, поэтому поле Error
@@ -132,6 +156,15 @@ func checksum(b []byte) uint16 {
 // runNeighbors пингует адреса вокруг цели: адресное правило против префикса/CDN.
 // Простой перебор /24 даёт больше информации, чем один идеально сделанный зонд.
 func runNeighbors(ctx context.Context, host string, scope string, limit int, workers int, deadline time.Duration) *NeighborsFacts {
+	if scope != "/16" {
+		scope = "/24"
+	}
+	if limit <= 0 {
+		limit = 16
+	}
+	if limit > 254 {
+		limit = 254
+	}
 	facts := &NeighborsFacts{Base: host, Scope: scope}
 	base := net.ParseIP(host)
 	if base == nil {
@@ -152,10 +185,10 @@ func runNeighbors(ctx context.Context, host string, scope string, limit int, wor
 	switch scope {
 	case "/16":
 		prefix := []byte{ip4[0], ip4[1], 0, 0}
-		candidates = samplePrefix(prefix, limit)
+		candidates = samplePrefix(prefix, limit, base)
 	default: // /24
 		prefix := []byte{ip4[0], ip4[1], ip4[2], 0}
-		candidates = samplePrefix(prefix, limit)
+		candidates = samplePrefix(prefix, limit, base)
 	}
 
 	if workers < 1 {
@@ -173,7 +206,8 @@ func runNeighbors(ctx context.Context, host string, scope string, limit int, wor
 			nctx, cancel := context.WithTimeout(ctx, deadline)
 			defer cancel()
 			f := NeighborFact{Address: cand.String()}
-			rtt, err := icmpOnce(nctx, cand, deadline)
+			rtt, method, err := icmpOnce(nctx, cand, deadline)
+			f.Method = method
 			if err != nil {
 				f.Error = err.Error()
 			} else {
@@ -194,11 +228,15 @@ func runNeighbors(ctx context.Context, host string, scope string, limit int, wor
 			facts.Dead++
 		}
 	}
+	if facts.Probed > 0 {
+		facts.AliveRatio = float64(facts.Alive) / float64(facts.Probed)
+	}
 	return facts
 }
 
-// samplePrefix берёт равномерную выборку адресов префикса, исключая .0 и .255.
-func samplePrefix(prefix []byte, limit int) []net.IP {
+// samplePrefix берёт равномерную выборку адресов префикса, исключая .0 и .255,
+// а также целевой адрес exclude.
+func samplePrefix(prefix []byte, limit int, exclude net.IP) []net.IP {
 	total := 254
 	if len(prefix) == 4 && prefix[2] == 0 && prefix[3] == 0 {
 		// /16: берём по одному адресу из каждого из 254 третьих октетов
@@ -216,6 +254,9 @@ func samplePrefix(prefix []byte, limit int) []net.IP {
 		ip := net.IPv4(prefix[0], prefix[1], prefix[2], byte(host))
 		if len(prefix) == 4 && prefix[2] == 0 && prefix[3] == 0 {
 			ip = net.IPv4(prefix[0], prefix[1], byte(host), 1)
+		}
+		if exclude != nil && ip.Equal(exclude) {
+			continue
 		}
 		out = append(out, ip)
 	}

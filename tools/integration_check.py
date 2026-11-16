@@ -34,9 +34,8 @@ from ruprobe_bot.settings import Settings  # noqa: E402
 
 
 SCENARIOS = [
-    ("example.com", TargetKind.DOMAIN, ["dns", "doh", "tcp", "sni", "sni_control", "tls_full", "throughput", "icmp"]),
-    ("192.0.2.1", TargetKind.NET, ["tcp", "tcp_alt_ports", "sni", "tls_full", "icmp", "neighbors"]),
-    ("198.51.100.0/29", TargetKind.CIDR, ["tcp", "icmp"]),
+    ("example.com", TargetKind.DOMAIN, ["dns", "doh", "tcp", "tcp_alt_ports", "sni", "sni_control", "tls_full", "throughput", "udp", "icmp"]),
+    ("198.51.100.0/29", TargetKind.CIDR, ["tcp", "tcp_alt_ports", "udp", "icmp"]),
 ]
 
 
@@ -113,6 +112,76 @@ async def main() -> int:
             if blocks > 500:
                 print("  FAIL: too many blocks")
                 failures += 1
+
+    # Детерминированная чёрная дыра TEST-NET-1: общий дедлайн и fast-fail дают
+    # время <= 2*timeout + соседи, а не сумму всех таймаутов; класс —
+    # UNAVAILABLE_OTHER при мёртвых соседях, а не BLOCK_L3L4.
+    print("\n=== scenario: 192.0.2.1 blackhole (deterministic) ===")
+    import time as _time
+
+    check_id = await create_check(
+        db,
+        target_value="192.0.2.1",
+        target_kind=TargetKind.NET,
+        observation_point_id=point.id,
+    )
+    started = _time.monotonic()
+    report = await run_check(
+        db,
+        agent,
+        settings,
+        targets=["192.0.2.1"],
+        observation_point_id=point.id,
+        check_id=check_id,
+        probes=["tcp", "tcp_alt_ports", "udp", "icmp", "neighbors"],
+        on_progress=on_progress,
+    )
+    elapsed = _time.monotonic() - started
+    budget = 2 * (settings.agent_timeout_ms / 1000.0) + 8.0
+    print(f"  elapsed: {elapsed:.1f}s (budget {budget:.1f}s)")
+    if report.status is not CheckStatus.DONE:
+        print(f"  error: {report.error}")
+        failures += 1
+    else:
+        item = report.reports[0]
+        print(
+            f"  {item.target}: {item.classification.klass.value} ({item.classification.confidence:.0%})"
+        )
+        if elapsed > budget:
+            print("  FAIL: blackhole took longer than 2*timeout + neighbors overhead")
+            failures += 1
+        if item.classification.klass.value != "unavailable_other":
+            print("  FAIL: dead network must be unavailable_other, not a block class")
+            failures += 1
+
+    # Живой зарубежный адрес: класс может меняться независимо от ТСПУ,
+    # поэтому без assert — только наблюдение (ручной сценарий).
+    print("\n=== scenario: 177.3.213.44 (manual, no class assert) ===")
+    check_id = await create_check(
+        db,
+        target_value="177.3.213.44",
+        target_kind=TargetKind.NET,
+        observation_point_id=point.id,
+    )
+    report = await run_check(
+        db,
+        agent,
+        settings,
+        targets=["177.3.213.44"],
+        observation_point_id=point.id,
+        check_id=check_id,
+        probes=["tcp", "tcp_alt_ports", "udp", "icmp", "neighbors"],
+        on_progress=on_progress,
+    )
+    if report.status is CheckStatus.DONE:
+        for item in report.reports:
+            print(
+                f"  {item.target}: {item.classification.klass.value} "
+                f"({item.classification.confidence:.0%}), icmp_method={item.icmp_method}, "
+                f"neighbors={item.neighbors_alive}/{item.neighbors_dead}"
+            )
+    else:
+        print(f"  error: {report.error}")
 
     # Рестарт агента посреди проверки: задание должно быть потеряно, а не висеть.
     print("\n=== scenario: agent loses job mid-check ===")

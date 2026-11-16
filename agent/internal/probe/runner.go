@@ -6,6 +6,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -170,6 +171,8 @@ type Options struct {
 	NeighborLimit int
 	NeighborScope string
 	Workers       int
+	// OnProbe вызывается перед каждым зондом: для прогресса внутри цели.
+	OnProbe func(string)
 }
 
 // DefaultPorts — порты для зонда tcp_alt_ports: правило по порту против правила по IP.
@@ -178,6 +181,9 @@ var DefaultPorts = []int{443, 80, 8080, 8443}
 // Run выполняет запрошенные зонды для одной цели и собирает структурированные факты.
 // Зонды независимы: падение одного не отменяет остальные, а лишь оставляет пробел
 // в данных — «нет данных» и «недоступно» не одно и то же.
+// Общий дедлайн: весь Run ограничен timeout_ms из батча, а не суммой таймаутов
+// зондов. Независимые зонды идут параллельно, зависимые (sni/tls/throughput)
+// запускаются только если TCP установился (fast-fail).
 func Run(ctx context.Context, opts Options) Result {
 	started := time.Now()
 	res := Result{
@@ -205,54 +211,141 @@ func Run(ctx context.Context, opts Options) Result {
 	}
 	want := func(k Kind) bool { return requested[k] || len(requested) == 0 }
 
-	if want(KindDNS) {
-		if opts.Target.Kind == TargetDomain {
-			res.Facts.DNS = runDNS(ctx, opts.Target.Host)
+	runCtx, cancel := context.WithTimeout(ctx, deadline)
+	defer cancel()
+	mark := func(k Kind) {
+		if opts.OnProbe != nil {
+			opts.OnProbe(string(k))
 		}
+	}
+	skip := func(k Kind, reason string) {
+		res.Errors = append(res.Errors, fmt.Sprintf("skipped: %s: %s", k, reason))
+	}
+
+	// Фаза 1 — независимые зонды параллельно.
+	var wg sync.WaitGroup
+	var dnsFacts *DNSFacts
+	var dohFacts *DNSFacts
+	var tcpFacts *TCPFacts
+	var altPorts []TCPFacts
+	var udpFacts *UDPFacts
+	var icmpFacts *ICMPFacts
+	var neighborsFacts *NeighborsFacts
+
+	if want(KindDNS) && opts.Target.Kind == TargetDomain {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			mark(KindDNS)
+			dnsFacts = runDNS(runCtx, opts.Target.Host)
+		}()
 	}
 	if want(KindDoH) && opts.Target.Kind == TargetDomain {
-		res.Facts.DoH = runDoH(ctx, opts.Target.Host)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			mark(KindDoH)
+			dohFacts = runDoH(runCtx, opts.Target.Host)
+		}()
 	}
 	if want(KindTCP) {
-		facts := tcpDial(ctx, host, port, deadline)
-		res.Facts.TCP = &facts
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			mark(KindTCP)
+			f := tcpDial(runCtx, host, port, deadline)
+			tcpFacts = &f
+		}()
 	}
 	if want(KindTCPAltPorts) {
-		for _, p := range DefaultPorts {
-			if p == port {
-				continue
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			mark(KindTCPAltPorts)
+			for _, p := range DefaultPorts {
+				if p == port {
+					continue
+				}
+				altPorts = append(altPorts, tcpDial(runCtx, host, p, deadline))
 			}
-			res.Facts.TCPAltPorts = append(res.Facts.TCPAltPorts, tcpDial(ctx, host, p, deadline))
-		}
-	}
-	if want(KindSNI) {
-		res.Facts.SNI = runSNI(ctx, host, port, sniOrHost(sni, host), deadline)
-	}
-	if want(KindSNIControl) {
-		res.Facts.SNIControl = runSNIControl(ctx, host, port, sni, deadline)
-	}
-	if want(KindTLSFull) {
-		res.Facts.TLSFull = runTLSFull(ctx, host, port, sni, deadline)
-	}
-	if want(KindThroughput) {
-		bytesWanted := opts.ThroughputBytes
-		if bytesWanted <= 0 {
-			bytesWanted = 1 << 20
-		}
-		res.Facts.Throughput = runThroughput(ctx, host, port, sni, bytesWanted, deadline)
+		}()
 	}
 	if want(KindUDP) {
-		res.Facts.UDP = runUDP(ctx, host, 443, "quic", deadline)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			mark(KindUDP)
+			udpFacts = runUDP(runCtx, host, 443, "quic", deadline)
+		}()
 	}
 	if want(KindICMP) {
-		res.Facts.ICMP = runICMP(ctx, host, 3, deadline)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			mark(KindICMP)
+			icmpFacts = runICMP(runCtx, host, 3, deadline)
+		}()
 	}
 	if want(KindNeighbors) {
-		scope := opts.NeighborScope
-		if scope == "" {
-			scope = "/24"
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			mark(KindNeighbors)
+			scope := opts.NeighborScope
+			if scope == "" {
+				scope = "/24"
+			}
+			neighborsFacts = runNeighbors(runCtx, host, scope, opts.NeighborLimit, opts.Workers, deadline)
+		}()
+	}
+	wg.Wait()
+
+	res.Facts.DNS = dnsFacts
+	res.Facts.DoH = dohFacts
+	res.Facts.TCP = tcpFacts
+	res.Facts.TCPAltPorts = altPorts
+	res.Facts.UDP = udpFacts
+	res.Facts.ICMP = icmpFacts
+	res.Facts.Neighbors = neighborsFacts
+
+	// Фаза 2 — зависимые зонды: только если TCP установился.
+	// Если TCP не запрашивался, гейт не применяется.
+	tcpRequested := want(KindTCP)
+	tcpOK := !tcpRequested || (tcpFacts != nil && tcpFacts.Connected)
+	dependent := []Kind{KindSNI, KindSNIControl, KindTLSFull, KindThroughput}
+	if !tcpOK {
+		for _, k := range dependent {
+			if want(k) {
+				skip(k, "tcp not connected")
+			}
 		}
-		res.Facts.Neighbors = runNeighbors(ctx, host, scope, opts.NeighborLimit, opts.Workers, deadline)
+	} else if runCtx.Err() == nil {
+		if want(KindSNI) {
+			mark(KindSNI)
+			res.Facts.SNI = runSNI(runCtx, host, port, sniOrHost(sni, host), deadline)
+		}
+		if want(KindSNIControl) {
+			mark(KindSNIControl)
+			res.Facts.SNIControl = runSNIControl(runCtx, host, port, sni, deadline)
+		}
+		if want(KindTLSFull) {
+			mark(KindTLSFull)
+			res.Facts.TLSFull = runTLSFull(runCtx, host, port, sni, deadline)
+		}
+		if want(KindThroughput) {
+			mark(KindThroughput)
+			bytesWanted := opts.ThroughputBytes
+			if bytesWanted <= 0 {
+				bytesWanted = 1 << 20
+			}
+			res.Facts.Throughput = runThroughput(runCtx, host, port, sni, bytesWanted, deadline)
+		}
+	} else {
+		for _, k := range dependent {
+			if want(k) {
+				skip(k, "overall deadline exceeded")
+			}
+		}
 	}
 
 	res.FinishedAt = time.Now()
